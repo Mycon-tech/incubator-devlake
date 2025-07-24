@@ -3,3 +3,4 @@ setuptools
 wheel
 dbt-mysql
 dbt-postgres
+azure-devops
