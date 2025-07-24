@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+version: "3"
 services:
   mysql:
     image: mysql:8
@@ -59,7 +60,7 @@ services:
       MYSQL_DATABASE: lake
       MYSQL_USER: merico
       MYSQL_PASSWORD: merico
-      TZ: America/Sao_Paulo
+      TZ: UTC
     restart: always
     depends_on:
       - mysql

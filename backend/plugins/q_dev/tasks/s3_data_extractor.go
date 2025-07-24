@@ -20,16 +20,17 @@ package tasks
 import (
 	"encoding/csv"
 	"fmt"
+	"io"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/apache/incubator-devlake/core/dal"
 	"github.com/apache/incubator-devlake/core/errors"
 	"github.com/apache/incubator-devlake/core/plugin"
 	"github.com/apache/incubator-devlake/plugins/q_dev/models"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"io"
-	"strconv"
-	"strings"
-	"time"
 )
 
 var _ plugin.SubTaskEntryPoint = ExtractQDevS3Data
@@ -70,19 +71,32 @@ func ExtractQDevS3Data(taskCtx plugin.SubTaskContext) errors.Error {
 			return errors.Convert(err)
 		}
 
-		// 处理CSV文件
-		err = processCSVData(taskCtx, db, getResult.Body, fileMeta)
-		if err != nil {
-			return errors.Default.Wrap(err, fmt.Sprintf("failed to process CSV file %s", fileMeta.FileName))
+		// Use a transaction to process the file and update its status
+		tx := db.Begin()
+		csvErr := processCSVData(taskCtx, tx, getResult.Body, fileMeta)
+		if csvErr != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				taskCtx.GetLogger().Error(rollbackErr, "failed to rollback transaction")
+			}
+			return errors.Default.Wrap(csvErr, fmt.Sprintf("failed to process CSV file %s", fileMeta.FileName))
 		}
 
-		// 更新文件处理状态
+		// Update file processing status within the same transaction
 		fileMeta.Processed = true
 		now := time.Now()
 		fileMeta.ProcessedTime = &now
-		err = db.Update(fileMeta)
+		err = tx.Update(fileMeta)
 		if err != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				taskCtx.GetLogger().Error(rollbackErr, "failed to rollback transaction")
+			}
 			return errors.Default.Wrap(err, "failed to update file metadata")
+		}
+
+		// Commit the transaction
+		err = tx.Commit()
+		if err != nil {
+			return errors.Default.Wrap(err, "failed to commit transaction")
 		}
 
 		taskCtx.IncProgress(1)
@@ -94,6 +108,9 @@ func ExtractQDevS3Data(taskCtx plugin.SubTaskContext) errors.Error {
 // 处理CSV文件
 func processCSVData(taskCtx plugin.SubTaskContext, db dal.Dal, reader io.ReadCloser, fileMeta *models.QDevS3FileMeta) errors.Error {
 	defer reader.Close()
+
+	// Get task data to access Identity Client
+	data := taskCtx.GetData().(*QDevTaskData)
 
 	csvReader := csv.NewReader(reader)
 	// 使用默认的逗号分隔符，不需要设置 Comma
@@ -117,13 +134,13 @@ func processCSVData(taskCtx plugin.SubTaskContext, db dal.Dal, reader io.ReadClo
 			return errors.Convert(err)
 		}
 
-		// 创建用户数据对象
-		userData, err := createUserData(headers, record, fileMeta)
+		// 创建用户数据对象 (updated to include display name resolution)
+		userData, err := createUserDataWithDisplayName(headers, record, fileMeta, data.IdentityClient)
 		if err != nil {
 			return errors.Default.Wrap(err, "failed to create user data")
 		}
 
-		// 保存到数据库
+		// Save to database - no need to check for duplicates since we're processing each file only once
 		err = db.Create(userData)
 		if err != nil {
 			return errors.Default.Wrap(err, "failed to save user data")
@@ -133,8 +150,13 @@ func processCSVData(taskCtx plugin.SubTaskContext, db dal.Dal, reader io.ReadClo
 	return nil
 }
 
-// 从CSV记录创建用户数据对象
-func createUserData(headers []string, record []string, fileMeta *models.QDevS3FileMeta) (*models.QDevUserData, errors.Error) {
+// UserDisplayNameResolver interface for resolving user display names
+type UserDisplayNameResolver interface {
+	ResolveUserDisplayName(userId string) (string, error)
+}
+
+// 从CSV记录创建用户数据对象 (enhanced with display name resolution)
+func createUserDataWithDisplayName(headers []string, record []string, fileMeta *models.QDevS3FileMeta, identityClient UserDisplayNameResolver) (*models.QDevUserData, errors.Error) {
 	userData := &models.QDevUserData{
 		ConnectionId: fileMeta.ConnectionId,
 	}
@@ -165,6 +187,9 @@ func createUserData(headers []string, record []string, fileMeta *models.QDevS3Fi
 		return nil, errors.Default.New("UserId not found in CSV record")
 	}
 
+	// 设置DisplayName (new functionality)
+	userData.DisplayName = resolveDisplayName(userData.UserId, identityClient)
+
 	// 设置Date
 	dateStr, ok := fieldMap["Date"]
 	if !ok {
@@ -176,7 +201,7 @@ func createUserData(headers []string, record []string, fileMeta *models.QDevS3Fi
 		return nil, errors.Default.Wrap(err, "failed to parse date")
 	}
 
-	// 设置指标字段
+	// 设置所有指标字段
 	userData.CodeReview_FindingsCount = parseInt(fieldMap, "CodeReview_FindingsCount")
 	userData.CodeReview_SucceededEventCount = parseInt(fieldMap, "CodeReview_SucceededEventCount")
 	userData.InlineChat_AcceptanceEventCount = parseInt(fieldMap, "InlineChat_AcceptanceEventCount")
@@ -192,8 +217,60 @@ func createUserData(headers []string, record []string, fileMeta *models.QDevS3Fi
 	userData.Inline_AICodeLines = parseInt(fieldMap, "Inline_AICodeLines")
 	userData.Inline_AcceptanceCount = parseInt(fieldMap, "Inline_AcceptanceCount")
 	userData.Inline_SuggestionsCount = parseInt(fieldMap, "Inline_SuggestionsCount")
+	userData.Chat_AICodeLines = parseInt(fieldMap, "Chat_AICodeLines")
+	userData.Chat_MessagesInteracted = parseInt(fieldMap, "Chat_MessagesInteracted")
+	userData.Chat_MessagesSent = parseInt(fieldMap, "Chat_MessagesSent")
+	userData.CodeFix_AcceptanceEventCount = parseInt(fieldMap, "CodeFix_AcceptanceEventCount")
+	userData.CodeFix_AcceptedLines = parseInt(fieldMap, "CodeFix_AcceptedLines")
+	userData.CodeFix_GeneratedLines = parseInt(fieldMap, "CodeFix_GeneratedLines")
+	userData.CodeFix_GenerationEventCount = parseInt(fieldMap, "CodeFix_GenerationEventCount")
+	userData.CodeReview_FailedEventCount = parseInt(fieldMap, "CodeReview_FailedEventCount")
+	userData.Dev_AcceptanceEventCount = parseInt(fieldMap, "Dev_AcceptanceEventCount")
+	userData.Dev_AcceptedLines = parseInt(fieldMap, "Dev_AcceptedLines")
+	userData.Dev_GeneratedLines = parseInt(fieldMap, "Dev_GeneratedLines")
+	userData.Dev_GenerationEventCount = parseInt(fieldMap, "Dev_GenerationEventCount")
+	userData.DocGeneration_AcceptedFileUpdates = parseInt(fieldMap, "DocGeneration_AcceptedFileUpdates")
+	userData.DocGeneration_AcceptedFilesCreations = parseInt(fieldMap, "DocGeneration_AcceptedFilesCreations")
+	userData.DocGeneration_AcceptedLineAdditions = parseInt(fieldMap, "DocGeneration_AcceptedLineAdditions")
+	userData.DocGeneration_AcceptedLineUpdates = parseInt(fieldMap, "DocGeneration_AcceptedLineUpdates")
+	userData.DocGeneration_EventCount = parseInt(fieldMap, "DocGeneration_EventCount")
+	userData.DocGeneration_RejectedFileCreations = parseInt(fieldMap, "DocGeneration_RejectedFileCreations")
+	userData.DocGeneration_RejectedFileUpdates = parseInt(fieldMap, "DocGeneration_RejectedFileUpdates")
+	userData.DocGeneration_RejectedLineAdditions = parseInt(fieldMap, "DocGeneration_RejectedLineAdditions")
+	userData.DocGeneration_RejectedLineUpdates = parseInt(fieldMap, "DocGeneration_RejectedLineUpdates")
+	userData.TestGeneration_AcceptedLines = parseInt(fieldMap, "TestGeneration_AcceptedLines")
+	userData.TestGeneration_AcceptedTests = parseInt(fieldMap, "TestGeneration_AcceptedTests")
+	userData.TestGeneration_EventCount = parseInt(fieldMap, "TestGeneration_EventCount")
+	userData.TestGeneration_GeneratedLines = parseInt(fieldMap, "TestGeneration_GeneratedLines")
+	userData.TestGeneration_GeneratedTests = parseInt(fieldMap, "TestGeneration_GeneratedTests")
+	userData.Transformation_EventCount = parseInt(fieldMap, "Transformation_EventCount")
+	userData.Transformation_LinesGenerated = parseInt(fieldMap, "Transformation_LinesGenerated")
+	userData.Transformation_LinesIngested = parseInt(fieldMap, "Transformation_LinesIngested")
 
 	return userData, nil
+}
+
+// resolveDisplayName resolves user ID to display name using Identity Client
+func resolveDisplayName(userId string, identityClient UserDisplayNameResolver) string {
+	// If no identity client available, use userId as fallback
+	if identityClient == nil {
+		return userId
+	}
+
+	// Try to resolve display name
+	displayName, err := identityClient.ResolveUserDisplayName(userId)
+	if err != nil {
+		// Log error but continue with userId as fallback
+		fmt.Printf("Failed to resolve display name for user %s: %v\n", userId, err)
+		return userId
+	}
+
+	// If display name is empty, use userId as fallback
+	if displayName == "" {
+		return userId
+	}
+
+	return displayName
 }
 
 // 解析日期

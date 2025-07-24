@@ -1,6 +1,6 @@
 # runtime dependencies
 setuptools
 wheel
+azure-devops
 dbt-mysql
 dbt-postgres
-azure-devops
