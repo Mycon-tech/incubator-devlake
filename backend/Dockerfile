@@ -32,18 +32,10 @@ VOLUME /app/logs
 # Setup Python requirements
 COPY python/ /app/python/
 RUN python3 -m pip install --no-cache --upgrade pip setuptools && \
-    python3 -m pip install --no-cache -r python/requirements.txt
-
-# Instala Poetry
-RUN curl -sSL https://install.python-poetry.org | python3 -
-ENV PATH="$PATH:/app/.local/bin"
+    python3 -m pip install --no-cache -r python/requirements.txt 
 
 # Build dos plugins Python
 RUN /app/python/build.sh
-
-# 👉 Instala azure-devops via poetry
-RUN poetry config virtualenvs.create false && \
-    poetry add azure-devops
 
 FROM base as devlake-base
 ARG DEBUG=
